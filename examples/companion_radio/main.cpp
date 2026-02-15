@@ -77,7 +77,7 @@ static uint32_t _atoi(const char* sp) {
   #elif defined(SERIAL_RX)
     #include <helpers/ArduinoSerialInterface.h>
     ArduinoSerialInterface serial_interface;
-    HardwareSerial companion_serial(1);
+    Uart companion_serial(NRF_UARTE1, UARTE1_IRQn, 1, 1);
   #else
     #include <helpers/ArduinoSerialInterface.h>
     ArduinoSerialInterface serial_interface;
