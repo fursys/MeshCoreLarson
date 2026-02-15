@@ -611,7 +611,7 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
                                               PAYLOAD_TYPE_RESPONSE, reply_data, reply_len);
         if (path) sendFlood(path, SERVER_RESPONSE_DELAY);
       } else {
-        mesh::Packet *reply =
+        mesh::Packet *reply = 
             createDatagram(PAYLOAD_TYPE_RESPONSE, client->id, secret, reply_data, reply_len);
         if (reply) {
           if (client->out_path_len >= 0) { // we have an out_path, so send DIRECT
@@ -761,6 +761,18 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   set_radio_at = revert_radio_at = 0;
   _logging = false;
   region_load_active = false;
+  companion_keys_valid = false;  // companion keys not yet generated
+  next_battery_check = 0;
+  last_battery_level = 100;
+  battery_alert_75_sent = false;
+  battery_alert_50_sent = false;
+  battery_alert_25_sent = false;
+
+  // Init battery voltage moving average
+  for (int i = 0; i < 5; i++) {
+    batt_voltages[i] = 0.0f;
+  }
+  batt_voltage_idx = 0;
 
 #if MAX_NEIGHBOURS
   memset(neighbours, 0, sizeof(neighbours));
@@ -809,6 +821,22 @@ void MyMesh::begin(FILESYSTEM *fs) {
   // load persisted prefs
   _cli.loadPrefs(_fs);
   acl.load(_fs, self_id);
+  // load companion identity if it exists
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  IdentityStore store(*fs, "");
+#elif defined(ESP32)
+  IdentityStore store(*fs, "/identity");
+#elif defined(RP2040_PLATFORM)
+  IdentityStore store(*fs, "/identity");
+#else
+  IdentityStore store(*fs, "");
+#endif
+  if (store.load("_companion", companion_id)) {
+    companion_keys_valid = true;
+    MESH_DEBUG_PRINTLN("Loaded companion keys");
+  } else {
+    companion_keys_valid = false;
+  }
   // TODO: key_store.begin();
   region_map.load(_fs);
 
@@ -971,7 +999,248 @@ void MyMesh::formatPacketStatsReply(char *reply) {
                                        getNumRecvFlood(), getNumRecvDirect());
 }
 
+void MyMesh::generateCompanionKeys() {
+  // Check if companion keys already exist
+  if (companion_keys_valid) {
+    Serial.println("Companion keys already generated");
+    Serial.print("Companion ID: ");
+    mesh::Utils::printHex(Serial, companion_id.pub_key, PUB_KEY_SIZE);
+    Serial.println();
+    // Send advertisement even if keys already exist
+    sendCompanionAdvertisement(100);
+    return;
+  }
+  
+  // Generate new companion identity
+  companion_id = radio_new_identity();
+  
+  // Ensure unique keys (avoid reserved hashes)
+  int count = 0;
+  while (count < 10 && (companion_id.pub_key[0] == 0x00 || companion_id.pub_key[0] == 0xFF)) {
+    companion_id = radio_new_identity();
+    count++;
+  }
+  
+  companion_keys_valid = true;
+  
+  // Save companion keys to filesystem
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  IdentityStore store(*_fs, "");
+#elif defined(ESP32)
+  IdentityStore store(*_fs, "/identity");
+#elif defined(RP2040_PLATFORM)
+  IdentityStore store(*_fs, "/identity");
+#else
+  IdentityStore store(*_fs, "");
+#endif
+  store.save("_companion", companion_id);
+  
+  Serial.println("Generated new companion keys");
+  Serial.print("Companion ID: ");
+  mesh::Utils::printHex(Serial, companion_id.pub_key, PUB_KEY_SIZE);
+  Serial.println();
+  
+  // Send companion advertisement
+  sendCompanionAdvertisement(100);
+}
+
+void MyMesh::sendCompanionAdvertisement(int delay_millis) {
+  if (!companion_keys_valid) {
+    Serial.println("Companion keys not generated");
+    return;
+  }
+  
+  // Create advertisement with companion identity as CHAT type
+  uint8_t app_data[MAX_ADVERT_DATA_SIZE];
+  
+  // Build companion name: repeater_name + "_С"
+  char comp_name[32] = "";
+  const char* node_name = getNodeName();
+  if (node_name && strlen(node_name) > 0) {
+    snprintf(comp_name, sizeof(comp_name), "%s_С", node_name);
+  } else {
+    strcpy(comp_name, "companion_С");
+  }
+  
+  AdvertDataBuilder builder(ADV_TYPE_CHAT, comp_name);
+  uint8_t app_data_len = builder.encodeTo(app_data);
+  
+  mesh::Packet *pkt = createAdvert(companion_id, app_data, app_data_len);
+  if (pkt) {
+    Serial.print("Sending companion advertisement (CHAT type), delay=");
+    Serial.print(delay_millis);
+    Serial.println(" ms");
+    sendFlood(pkt, delay_millis);
+  } else {
+    Serial.println("ERROR: unable to create companion advertisement packet!");
+  }
+}
+
+void MyMesh::checkBatteryAndAlert() {
+  // Get current battery voltage in millivolts
+  uint16_t batt_mv = board.getBattMilliVolts();
+
+  // Add the new reading to our moving average array
+  batt_voltages[batt_voltage_idx] = (float)batt_mv / 1000.0f;
+  batt_voltage_idx = (batt_voltage_idx + 1) % 5;
+
+  // Calculate the average voltage
+  float voltage = 0;
+  for (int i = 0; i < 5; i++) {
+    voltage += batt_voltages[i];
+  }
+  voltage /= 5;
+
+  // if we haven't filled the buffer yet, the average will be artificially low, so just use the current reading
+  if (batt_voltages[4] == 0.0f) {
+    voltage = (float)batt_mv / 1000.0f;
+  }
+  
+  // Calculate battery percentage (assuming 4.2V = 100%, 3.0V = 0%)
+  // This is a simple linear approximation
+  uint8_t battery_percent;
+  
+  if (voltage >= 4.2f) {
+    battery_percent = 100;
+  } else if (voltage <= 3.0f) {
+    battery_percent = 0;
+  } else {
+    battery_percent = (uint8_t)((voltage - 3.0f) / (4.2f - 3.0f) * 100.0f);
+  }
+  
+  // Reset flags if battery level goes back up (with hysteresis to avoid oscillation)
+  if (battery_percent > 80) {
+    battery_alert_75_sent = false;
+    battery_alert_50_sent = false;
+    battery_alert_25_sent = false;
+  } else if (battery_percent > 55) {
+    battery_alert_50_sent = false;
+    battery_alert_25_sent = false;
+  } else if (battery_percent > 30) {
+    battery_alert_25_sent = false;
+  }
+  
+  // Check if we crossed any threshold downward
+  bool should_alert = false;
+  
+  if (battery_percent <= 25 && !battery_alert_25_sent && last_battery_level > 25) {
+    battery_alert_25_sent = true;
+    should_alert = true;
+  } else if (battery_percent <= 50 && !battery_alert_50_sent && last_battery_level > 50) {
+    battery_alert_50_sent = true;
+    should_alert = true;
+  } else if (battery_percent <= 75 && !battery_alert_75_sent && last_battery_level > 75) {
+    battery_alert_75_sent = true;
+    should_alert = true;
+  }
+  
+  last_battery_level = battery_percent;
+  
+  if (should_alert) {
+    // Send battery alert to all admins from companion identity
+    char text[64];
+    snprintf(text, sizeof(text), "Battery: %d%% (%.2fV)", battery_percent, voltage);
+    
+    Serial.print("Battery alert: ");
+    Serial.println(text);
+    
+    if (!companion_keys_valid) {
+      Serial.println("Companion keys not generated, cannot send battery alert");
+      return;
+    }
+    
+    for (int i = 0; i < acl.getNumClients(); i++) {
+      auto c = acl.getClientByIdx(i);
+      if (!c || !c->isAdmin() || c->permissions == 0) continue;
+
+      uint8_t payload[5 + 64];
+      uint32_t ts = getRTCClock()->getCurrentTimeUnique();
+      memcpy(payload, &ts, 4);
+      payload[4] = (TXT_TYPE_PLAIN << 2);  // plain text
+      memcpy(&payload[5], text, strlen(text));
+
+      // Calculate shared_secret between companion and admin
+      uint8_t companion_secret[32];
+      companion_id.calcSharedSecret(companion_secret, c->id);
+
+      // Create TXT_MSG from companion_id
+      auto pkt = createDatagramFrom(companion_id, PAYLOAD_TYPE_TXT_MSG, c->id, companion_secret, payload, 5 + strlen(text));
+      if (pkt) {
+        if (c->out_path_len >= 0) {
+          sendDirect(pkt, c->out_path, c->out_path_len, TXT_ACK_DELAY);
+        } else {
+          sendFlood(pkt, TXT_ACK_DELAY);
+        }
+      }
+    }
+  }
+}
+
+mesh::Packet* MyMesh::createDatagramFrom(const mesh::LocalIdentity& from, uint8_t type, const mesh::Identity& dest, 
+                                         const uint8_t* secret, const uint8_t* data, size_t data_len) {
+  if (type == PAYLOAD_TYPE_TXT_MSG || type == PAYLOAD_TYPE_REQ || type == PAYLOAD_TYPE_RESPONSE) {
+    if (data_len + CIPHER_MAC_SIZE + CIPHER_BLOCK_SIZE-1 > MAX_PACKET_PAYLOAD) return NULL;
+  } else {
+    return NULL;  // invalid type
+  }
+
+  mesh::Packet* packet = obtainNewPacket();
+  if (packet == NULL) {
+    Serial.println("createDatagramFrom: packet pool empty");
+    return NULL;
+  }
+  packet->header = (type << PH_TYPE_SHIFT);  // ROUTE_TYPE_* set later
+
+  int len = 0;
+  len += dest.copyHashTo(&packet->payload[len]);  // dest hash
+  len += from.copyHashTo(&packet->payload[len]);  // src hash (from companion!)
+  len += mesh::Utils::encryptThenMAC(secret, &packet->payload[len], data, data_len);
+
+  packet->payload_len = len;
+
+  return packet;
+}
+
+void MyMesh::sendHelloAdmins() {
+  if (!companion_keys_valid) {
+    Serial.println("Companion keys not generated, cannot send message");
+    return;
+  }
+  
+  const char *text = "Hello from repiter";
+  uint8_t text_len = strlen(text);
+
+  for (int i = 0; i < acl.getNumClients(); i++) {
+    auto c = acl.getClientByIdx(i);
+    if (!c || !c->isAdmin() || c->permissions == 0) continue;
+
+    uint8_t payload[5 + 64];
+    uint32_t ts = getRTCClock()->getCurrentTimeUnique();
+    memcpy(payload, &ts, 4);
+    payload[4] = (TXT_TYPE_PLAIN << 2);  // plain text
+    memcpy(&payload[5], text, text_len);
+
+    // Calculate shared_secret between companion and admin
+    uint8_t companion_secret[32];
+    companion_id.calcSharedSecret(companion_secret, c->id);
+
+    // Create TXT_MSG from companion_id
+    auto pkt = createDatagramFrom(companion_id, PAYLOAD_TYPE_TXT_MSG, c->id, companion_secret, payload, 5 + text_len);
+    if (pkt) {
+      Serial.println("Sending message from companion identity");
+      if (c->out_path_len >= 0) {
+        sendDirect(pkt, c->out_path, c->out_path_len, TXT_ACK_DELAY);
+      } else {
+        sendFlood(pkt, TXT_ACK_DELAY);
+      }
+    } else {
+      Serial.println("ERROR: Failed to create companion message packet");
+    }
+  }
+}
+
 void MyMesh::saveIdentity(const mesh::LocalIdentity &new_id) {
+  self_id = new_id;
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
   IdentityStore store(*_fs, "");
 #elif defined(ESP32)
@@ -981,7 +1250,7 @@ void MyMesh::saveIdentity(const mesh::LocalIdentity &new_id) {
 #else
 #error "need to define saveIdentity()"
 #endif
-  store.save("_main", new_id);
+  store.save("_main", self_id);
 }
 
 void MyMesh::clearStats() {
@@ -1056,6 +1325,29 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
         strcpy(reply, "Err - bad pubkey");
       }
     }
+  } else if (strcmp(command, "start companion") == 0) {
+    // Generate companion keys and send advertisement (admin only)
+    Serial.println("Generating companion keys...");
+    generateCompanionKeys();
+    
+    // Format reply with key information
+    if (companion_keys_valid) {
+      char hex_key[PUB_KEY_SIZE * 2 + 1];
+      mesh::Utils::toHex(hex_key, companion_id.pub_key, PUB_KEY_SIZE);
+      sprintf(reply, "OK - Companion key: %s", hex_key);
+      
+      // Also output to local console
+      Serial.print("Companion public key: ");
+      mesh::Utils::printHex(Serial, companion_id.pub_key, PUB_KEY_SIZE);
+      Serial.println();
+    } else {
+      strcpy(reply, "Err - failed to generate companion keys");
+    }
+  } else if (strcmp(command, "test companion") == 0) {
+    // Send test message from companion identity to all admins
+    Serial.println("Sending test message from companion...");
+    sendHelloAdmins();
+    strcpy(reply, "OK - test message sent from companion");
   } else if (sender_timestamp == 0 && strcmp(command, "get acl") == 0) {
     Serial.println("ACL:");
     for (int i = 0; i < acl.getNumClients(); i++) {
@@ -1181,15 +1473,11 @@ void MyMesh::loop() {
   mesh::Mesh::loop();
 
   if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
-    mesh::Packet *pkt = createSelfAdvert();
-    if (pkt) sendFlood(pkt);
-
+    sendSelfAdvertisement(0, true);
     updateFloodAdvertTimer(); // schedule next flood advert
     updateAdvertTimer();      // also schedule local advert (so they don't overlap)
   } else if (next_local_advert && millisHasNowPassed(next_local_advert)) {
-    mesh::Packet *pkt = createSelfAdvert();
-    if (pkt) sendZeroHop(pkt);
-
+    sendSelfAdvertisement(0, false);
     updateAdvertTimer(); // schedule next local advert
   }
 
@@ -1209,6 +1497,12 @@ void MyMesh::loop() {
   if (dirty_contacts_expiry && millisHasNowPassed(dirty_contacts_expiry)) {
     acl.save(_fs);
     dirty_contacts_expiry = 0;
+  }
+
+  // check battery level periodically (every 15 minutes)
+  if (next_battery_check == 0 || millisHasNowPassed(next_battery_check)) {
+    checkBatteryAndAlert();
+    next_battery_check = millis() + 900000;  // check again in 15 minutes (900 seconds)
   }
 
   // update uptime

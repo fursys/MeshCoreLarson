@@ -73,7 +73,7 @@ struct NeighbourInfo {
 #endif
 
 #ifndef FIRMWARE_VERSION
-  #define FIRMWARE_VERSION   "v1.13.0"
+  #define FIRMWARE_VERSION   "v1.13.0_LarsonMod"
 #endif
 
 #define FIRMWARE_ROLE "repeater"
@@ -109,6 +109,16 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   uint8_t pending_sf;
   uint8_t pending_cr;
   int  matching_peer_indexes[MAX_CLIENTS];
+  mesh::LocalIdentity companion_id;  // companion role identity
+  bool companion_keys_valid;         // whether companion keys have been generated
+  unsigned long next_battery_check;  // timer for periodic battery check
+  uint8_t last_battery_level;        // last known battery percentage (for threshold detection)
+  bool battery_alert_75_sent;        // true if 75% alert already sent
+  bool battery_alert_50_sent;        // true if 50% alert already sent
+  bool battery_alert_25_sent;        // true if 25% alert already sent
+  // moving average for battery voltage
+  float batt_voltages[5];            // array to store last 5 voltage readings
+  int batt_voltage_idx;              // index for the moving average array
 #if defined(WITH_RS232_BRIDGE)
   RS232Bridge bridge;
 #elif defined(WITH_ESPNOW_BRIDGE)
@@ -122,6 +132,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   uint8_t handleAnonClockReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
   int handleRequest(ClientInfo* sender, uint32_t sender_timestamp, uint8_t* payload, size_t payload_len);
   mesh::Packet* createSelfAdvert();
+  mesh::Packet* createDatagramFrom(const mesh::LocalIdentity& from, uint8_t type, const mesh::Identity& dest, const uint8_t* secret, const uint8_t* data, size_t data_len);
 
   File openAppend(const char* fname);
 
@@ -204,6 +215,18 @@ public:
   void formatStatsReply(char *reply) override;
   void formatRadioStatsReply(char *reply) override;
   void formatPacketStatsReply(char *reply) override;
+
+  // send text to all admin clients
+  void sendHelloAdmins();
+
+  // generate new companion keys and save them
+  void generateCompanionKeys();
+
+  // create and send companion advertisement with the generated identity
+  void sendCompanionAdvertisement(int delay_millis);
+
+  // check battery level and send alerts to admins if thresholds crossed
+  void checkBatteryAndAlert();
 
   mesh::LocalIdentity& getSelfId() override { return self_id; }
 
